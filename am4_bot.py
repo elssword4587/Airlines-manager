@@ -24,6 +24,11 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+import asyncio
+
+# Optional pyppeteer fallback: when system Chromium isn't available (e.g. Termux),
+# pyppeteer can download a headless Chromium via pip and be used as a replacement
+# for limited browser interactions. Import lazily in setup_driver().
 
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 
@@ -101,6 +106,7 @@ class AM4Bot:
         depart_check_interval_max_seconds: Optional[int] = None,
         fuel_check_interval_min_seconds: Optional[int] = None,
         fuel_check_interval_max_seconds: Optional[int] = None,
+        mode: str = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.fuel_threshold = fuel_threshold
@@ -156,6 +162,9 @@ class AM4Bot:
             fuel_min,
             fuel_max,
         )
+        # Automation mode: 'auto' (try selenium, then pyppeteer), 'selenium',
+        # 'pyppeteer', or 'http' (requests-only)
+        self.mode = mode or "auto"
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -167,6 +176,15 @@ class AM4Bot:
             }
         )
         self.driver: Optional[webdriver.Chrome] = None
+        # pyppeteer runtime objects (created lazily)
+        self.pyppeteer_browser = None
+        self.pyppeteer_page = None
+        self.pyppeteer_loop = None
+        # Playwright runtime (sync API)
+        self.playwright = None
+        self.playwright_browser = None
+        self.playwright_context = None
+        self.playwright_page = None
 
     @staticmethod
     def _parse_env_number(value: Optional[str]) -> Optional[int]:
@@ -236,6 +254,32 @@ class AM4Bot:
         if self.driver is not None:
             return
 
+        if self.mode == "http":
+            log("Mode is http: skipping browser initialization.")
+            return
+        # If mode forces playwright, try that first
+        if self.mode == "playwright":
+            try:
+                from playwright.sync_api import sync_playwright  # type: ignore
+
+                log("Attempting to launch Playwright Chromium (headless).")
+                p = sync_playwright().start()
+                browser = p.chromium.launch(headless=self.headless, args=["--no-sandbox","--disable-dev-shm-usage","--window-size=430,900"]) 
+                ua = self.session.headers.get("User-Agent")
+                context = browser.new_context(user_agent=ua)
+                page = context.new_page()
+                self.playwright = p
+                self.playwright_browser = browser
+                self.playwright_context = context
+                self.playwright_page = page
+                log("Playwright Chromium launched and ready.")
+                return
+            except Exception as pw_exc:
+                log(f"Playwright launch failed: {pw_exc}")
+            # If Playwright failed in forced mode, stop here.
+            if self.mode == "playwright":
+                return
+
         try:
             chrome_options = Options()
             if self.headless:
@@ -261,11 +305,105 @@ class AM4Bot:
                 "Some Selenium-based actions will be skipped."
             )
             self.driver = None
+            # Attempt pyppeteer fallback when Selenium/Chromium can't start,
+            # unless mode forces selenium only or http-only.
+            if self.mode == "selenium":
+                log("Mode is selenium and driver failed; not attempting pyppeteer fallback.")
+                self.pyppeteer_browser = None
+                self.pyppeteer_page = None
+                self.pyppeteer_loop = None
+                return
+            if self.mode == "http":
+                self.pyppeteer_browser = None
+                self.pyppeteer_page = None
+                self.pyppeteer_loop = None
+                return
+
+            # Attempt Playwright next (unless mode restricts), then pyppeteer fallback.
+            try:
+                from playwright.sync_api import sync_playwright  # type: ignore
+
+                log("Attempting to launch Playwright Chromium (headless) as fallback.")
+                p = sync_playwright().start()
+                browser = p.chromium.launch(headless=self.headless, args=["--no-sandbox","--disable-dev-shm-usage","--window-size=430,900"]) 
+                ua = self.session.headers.get("User-Agent")
+                context = browser.new_context(user_agent=ua)
+                page = context.new_page()
+                self.playwright = p
+                self.playwright_browser = browser
+                self.playwright_context = context
+                self.playwright_page = page
+                log("Playwright Chromium launched and ready (fallback).")
+            except Exception:
+                # Attempt pyppeteer fallback when Selenium/Chromium and Playwright can't start.
+                try:
+                    from pyppeteer import launch  # type: ignore
+
+                    log("Attempting to launch pyppeteer-managed Chromium (headless).")
+
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    browser = loop.run_until_complete(
+                        launch(
+                            headless=self.headless,
+                            args=[
+                                "--no-sandbox",
+                                "--disable-dev-shm-usage",
+                                "--window-size=430,900",
+                            ],
+                        )
+                    )
+                    page = loop.run_until_complete(browser.newPage())
+                    ua = (
+                        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0 Mobile Safari/537.36"
+                    )
+                    loop.run_until_complete(page.setUserAgent(ua))
+                    self.pyppeteer_browser = browser
+                    self.pyppeteer_page = page
+                    self.pyppeteer_loop = loop
+                    log("Pyppeteer Chromium launched and ready.")
+                except Exception as pb_exc:
+                    log(f"Pyppeteer fallback failed: {pb_exc}. No browser automation available.")
+                    self.pyppeteer_browser = None
+                    self.pyppeteer_page = None
+                    self.pyppeteer_loop = None
 
     def close_driver(self) -> None:
         if self.driver is not None:
             self.driver.quit()
             self.driver = None
+        if self.pyppeteer_browser is not None and self.pyppeteer_loop is not None:
+            try:
+                self.pyppeteer_loop.run_until_complete(self.pyppeteer_browser.close())
+            except Exception:
+                pass
+            try:
+                self.pyppeteer_loop.close()
+            except Exception:
+                pass
+            self.pyppeteer_browser = None
+            self.pyppeteer_page = None
+            self.pyppeteer_loop = None
+        if self.playwright_browser is not None and self.playwright is not None:
+            try:
+                if self.playwright_context is not None:
+                    try:
+                        self.playwright_context.close()
+                    except Exception:
+                        pass
+                self.playwright_browser.close()
+            except Exception:
+                pass
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright_browser = None
+            self.playwright_context = None
+            self.playwright_page = None
+            self.playwright = None
 
     def fetch(self, url: str) -> str:
         response = self.session.get(url, timeout=30)
@@ -281,15 +419,50 @@ class AM4Bot:
         return BeautifulSoup(response.text, "html.parser")
 
     def sync_session_cookies(self) -> None:
-        if self.driver is None:
-            return
-        for cookie in self.driver.get_cookies():
-            self.session.cookies.set(
-                cookie["name"],
-                cookie["value"],
-                domain=cookie.get("domain") or self.base_url.split("//", 1)[1],
-                path=cookie.get("path") or "/",
-            )
+        if self.driver is not None:
+            for cookie in self.driver.get_cookies():
+                self.session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain") or self.base_url.split("//", 1)[1],
+                    path=cookie.get("path") or "/",
+                )
+
+        if self.playwright_context is not None:
+            cookies = []
+            base_domain = self.base_url.split("//", 1)[1].split("/", 1)[0]
+            for cookie in self.session.cookies:
+                domain = cookie.domain.lstrip(".") if cookie.domain else base_domain
+                cookies.append(
+                    {
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": domain,
+                        "path": cookie.path or "/",
+                    }
+                )
+            if cookies:
+                try:
+                    self.playwright_context.add_cookies(cookies)
+                except Exception:
+                    pass
+
+        if self.pyppeteer_page is not None and self.pyppeteer_loop is not None:
+            base_domain = self.base_url.split("//", 1)[1].split("/", 1)[0]
+            for cookie in self.session.cookies:
+                domain = cookie.domain.lstrip(".") if cookie.domain else base_domain
+                cookie_dict = {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": domain,
+                    "path": cookie.path or "/",
+                }
+                try:
+                    self.pyppeteer_loop.run_until_complete(
+                        self.pyppeteer_page.setCookie(cookie_dict)
+                    )
+                except Exception:
+                    pass
 
     def ensure_logged_in(self) -> None:
         if not self.email or not self.password:
@@ -410,6 +583,48 @@ class AM4Bot:
             log(f"Failed to fetch fuel details: {exc}")
             return None
 
+    def get_co2_snapshot(self) -> Optional[dict]:
+        try:
+            response = self.session.get(f"{self.base_url}/co2.php", timeout=30)
+            response.raise_for_status()
+            html = response.text
+            # Try to find numeric price and capacity using regex
+            price_match = re.search(r"Current price.*?\$\s*([0-9,]+)", html, re.S)
+            rem_capacity_match = re.search(r"remCapacity[^>]*>([0-9,]+)</span>.*?/.*?([0-9,]+)", html, re.S)
+            holding_match = re.search(r"id=['\"]holding['\"].*?>([0-9,]+)</span>", html, re.S)
+
+            if not price_match:
+                # Fallback: look for .price class in the HTML
+                soup = BeautifulSoup(html, "html.parser")
+                el = soup.select_one("#co2Main .price")
+                price = self.parse_int(el.get_text(" ", strip=True)) if el else 0
+            else:
+                price = self.parse_int(price_match.group(1))
+
+            if rem_capacity_match:
+                remaining_capacity = self.parse_int(rem_capacity_match.group(1))
+                total_capacity = self.parse_int(rem_capacity_match.group(2))
+            else:
+                remaining_capacity = 0
+                total_capacity = 0
+
+            holding = self.parse_int(holding_match.group(1)) if holding_match else 0
+
+            log(
+                "CO2 snapshot: "
+                f"price={price}, capacity={remaining_capacity}/{total_capacity}, holding={holding}"
+            )
+
+            return {
+                "price": price,
+                "remaining_capacity": remaining_capacity,
+                "total_capacity": total_capacity,
+                "holding": holding,
+            }
+        except requests.RequestException as exc:
+            log(f"Failed to fetch CO2 details: {exc}")
+            return None
+
     def log_status_snapshot(self) -> None:
         balance = self.get_bank_balance()
         departure_count = "unknown"
@@ -423,7 +638,27 @@ class AM4Bot:
             except Exception as exc:
                 departure_count = f"error: {exc}"
         else:
-            departure_count = "browser unavailable"
+            # If mode=http, attempt to get departure info via HTTP
+            if self.mode == "http":
+                try:
+                    _, depart_text = self.get_departure_summary()
+                    departure_count = depart_text
+                except Exception as exc:
+                    departure_count = f"error: {exc}"
+            else:
+                # Try pyppeteer fallback to obtain departure count
+                if self.pyppeteer_page is not None:
+                    try:
+                        content = self.pyppeteer_loop.run_until_complete(
+                            self.pyppeteer_page.evaluate(
+                                "() => document.getElementById('listDepartAmount') ? document.getElementById('listDepartAmount').textContent.trim() : null"
+                            )
+                        )
+                        departure_count = content if content else "not found"
+                    except Exception as exc:
+                        departure_count = f"error: {exc}"
+                else:
+                    departure_count = "browser unavailable"
         log(
             "Status snapshot: "
             f"balance={balance if balance is not None else 'n/a'}, "
@@ -551,51 +786,105 @@ class AM4Bot:
             log(f"Eco-friendly campaign request failed: {exc}")
 
     def better_auto_price(self) -> None:
+        # Try Selenium first; if unavailable use pyppeteer to extract the onclick
         self.setup_driver()
-        if self.driver is None:
-            log("Skipping auto-price check because browser automation is unavailable.")
+        if self.driver is not None:
+            try:
+                self.driver.get(self.base_url)
+                wait = WebDriverWait(self.driver, 15)
+                intro = wait.until(EC.presence_of_element_located((By.ID, "introAuto")))
+                onclick = intro.get_attribute("onclick") or ""
+                if not onclick:
+                    log("No onclick attribute found for introAuto.")
+                    return
+                values_part = onclick[onclick.find("(") + 1 : onclick.find(")")]
+                values = [item.strip() for item in values_part.split(",")]
+                price_values = values[:4]
+                log(
+                    "Auto-price values detected: "
+                    f"{price_values} (status: ready for review)."
+                )
+            except (TimeoutException, NoSuchElementException):
+                log("Could not find auto-price button on the page.")
+            except Exception as exc:
+                log(f"Auto-price check failed: {exc}")
             return
 
-        try:
-            self.driver.get(self.base_url)
-            wait = WebDriverWait(self.driver, 15)
-            intro = wait.until(EC.presence_of_element_located((By.ID, "introAuto")))
-            onclick = intro.get_attribute("onclick") or ""
-            if not onclick:
-                log("No onclick attribute found for introAuto.")
-                return
-            values_part = onclick[onclick.find("(") + 1 : onclick.find(")")]
-            values = [item.strip() for item in values_part.split(",")]
-            price_values = values[:4]
-            log(
-                "Auto-price values detected: "
-                f"{price_values} (status: ready for review)."
-            )
-        except (TimeoutException, NoSuchElementException):
-            log("Could not find auto-price button on the page.")
+        if self.pyppeteer_page is not None:
+            try:
+                loop = self.pyppeteer_loop
+                loop.run_until_complete(self.pyppeteer_page.goto(self.base_url))
+                onclick = loop.run_until_complete(
+                    self.pyppeteer_page.evaluate(
+                        "() => (document.getElementById('introAuto')||{}).getAttribute('onclick') || ''"
+                    )
+                )
+                if not onclick:
+                    log("No onclick attribute found for introAuto (pyppeteer).")
+                    return
+                values_part = onclick[onclick.find("(") + 1 : onclick.find(")")]
+                values = [item.strip() for item in values_part.split(",")]
+                price_values = values[:4]
+                log(
+                    "Auto-price values detected (pyppeteer): "
+                    f"{price_values} (status: ready for review)."
+                )
+            except Exception as exc:
+                log(f"Could not find auto-price button via pyppeteer: {exc}")
 
     def depart_all(self) -> None:
-        if self.driver is None:
-            log("Selenium driver is required to click the departure button.")
+        # Try Selenium first, then pyppeteer fallback for clicking the departure UI
+        if self.driver is not None:
+            try:
+                count = self.driver.find_element(By.ID, "listDepartAmount")
+                flight_count = count.text.strip()
+                log(
+                    f"Departure panel shows {flight_count} flight(s) ready to depart. "
+                    "Exact aircraft details will be logged once the flight list is available."
+                )
+                if flight_count != "0":
+                    self.start_eco_campaign()
+                    time.sleep(1)
+                    button = count.find_element(By.XPATH, "..")
+                    self.driver.execute_script("arguments[0].click();", button)
+                    log(
+                        f"✅ Departure action triggered for {flight_count} flight(s)."
+                    )
+                return
+            except NoSuchElementException:
+                log("Could not find departure elements (selenium).")
+
+        if self.pyppeteer_page is not None and self.pyppeteer_loop is not None:
+            try:
+                loop = self.pyppeteer_loop
+                # Ensure main page is loaded to read the element
+                loop.run_until_complete(self.pyppeteer_page.goto(self.base_url))
+                flight_count = loop.run_until_complete(
+                    self.pyppeteer_page.evaluate(
+                        "() => { const el = document.getElementById('listDepartAmount'); return el ? el.textContent.trim() : null }"
+                    )
+                )
+                if flight_count is None:
+                    log("Could not find departure elements (pyppeteer).")
+                    return
+                log(
+                    f"Departure panel shows {flight_count} flight(s) ready to depart."
+                )
+                if flight_count != "0":
+                    self.start_eco_campaign()
+                    time.sleep(1)
+                    # Click the parent element to trigger departure
+                    loop.run_until_complete(
+                        self.pyppeteer_page.evaluate(
+                            "() => { const el = document.getElementById('listDepartAmount'); if (el && el.parentElement) el.parentElement.click(); }"
+                        )
+                    )
+                    log(f"✅ Departure action triggered for {flight_count} flight(s) (pyppeteer).")
+            except Exception as exc:
+                log(f"Departure via pyppeteer failed: {exc}")
             return
 
-        try:
-            count = self.driver.find_element(By.ID, "listDepartAmount")
-            flight_count = count.text.strip()
-            log(
-                f"Departure panel shows {flight_count} flight(s) ready to depart. "
-                "Exact aircraft details will be logged once the flight list is available."
-            )
-            if flight_count != "0":
-                self.start_eco_campaign()
-                time.sleep(1)
-                button = count.find_element(By.XPATH, "..")
-                self.driver.execute_script("arguments[0].click();", button)
-                log(
-                    f"✅ Departure action triggered for {flight_count} flight(s)."
-                )
-        except NoSuchElementException:
-            log("Could not find departure elements.")
+        log("Browser automation is unavailable; cannot trigger departure UI clicks.")
 
     def auto_depart_routine(self) -> None:
         # Human-like random delay between roughly 4 and 7 minutes.
@@ -638,77 +927,224 @@ class AM4Bot:
             log(f"CO2 buy failed: {exc}")
 
     def scan_consumables(self) -> None:
-        if self.driver is None:
-            log("Selenium driver is required to inspect consumable windows.")
-            return
-
-        try:
-            self.driver.execute_script(
-                "popup('fuel.php', 'Fuel', false, false, true);"
-            )
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "fuelMain"))
-            )
-            fuel_panel = self.driver.find_element(By.ID, "fuelMain")
-            fuel_price = fuel_panel.find_element(By.CSS_SELECTOR, ".price")
-            fuel_price_value = self.parse_int(fuel_price.text)
-            log(
-                "Fuel snapshot: "
-                f"current price={fuel_price_value}, "
-                f"threshold={self.fuel_threshold}"
-            )
-
-            if fuel_price_value <= self.fuel_threshold:
-                capacity = self.parse_int(
-                    fuel_panel.find_element(By.CSS_SELECTOR, ".capacity").text
-                )
-                balance = self.get_bank_balance()
-                if balance is None:
-                    return
-                buyable = int(balance / fuel_price_value * 1000) if fuel_price_value else 0
-                amount = min(buyable, capacity)
-                if amount > 0:
-                    log(
-                        f"Attempting fuel purchase: {amount} liters at {fuel_price_value} each."
-                    )
-                    self.buy_fuel(amount, fuel_price_value)
-                else:
-                    log("Not enough balance to buy fuel right now.")
-
-            # CO2 panel is opened by clicking the button in the popup.
+        # Prefer Selenium when available. If mode is http, always use HTTP
+        # requests to read fuel/co2 pages. Otherwise, fallback to pyppeteer
+        # when Selenium is unavailable.
+        if self.driver is not None:
             try:
-                self.driver.find_element(By.ID, "popBtn2").click()
+                self.driver.execute_script(
+                    "popup('fuel.php', 'Fuel', false, false, true);"
+                )
                 WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.ID, "co2Main"))
+                    EC.presence_of_element_located((By.ID, "fuelMain"))
                 )
-                co2_panel = self.driver.find_element(By.ID, "co2Main")
-                co2_price = co2_panel.find_element(By.CSS_SELECTOR, ".price")
-                co2_price_value = self.parse_int(co2_price.text)
+                fuel_panel = self.driver.find_element(By.ID, "fuelMain")
+                fuel_price = fuel_panel.find_element(By.CSS_SELECTOR, ".price")
+                fuel_price_value = self.parse_int(fuel_price.text)
                 log(
-                    "CO2 snapshot: "
-                    f"current price={co2_price_value}, "
-                    f"threshold={self.co2_threshold}"
+                    "Fuel snapshot: "
+                    f"current price={fuel_price_value}, "
+                    f"threshold={self.fuel_threshold}"
                 )
-                if co2_price_value <= self.co2_threshold:
+
+                if fuel_price_value <= self.fuel_threshold:
                     capacity = self.parse_int(
-                        co2_panel.find_element(By.CSS_SELECTOR, ".capacity").text
+                        fuel_panel.find_element(By.CSS_SELECTOR, ".capacity").text
                     )
                     balance = self.get_bank_balance()
                     if balance is None:
                         return
-                    buyable = int(balance / co2_price_value * 1000) if co2_price_value else 0
+                    buyable = int(balance / fuel_price_value * 1000) if fuel_price_value else 0
                     amount = min(buyable, capacity)
                     if amount > 0:
                         log(
-                            f"Attempting CO2 purchase: {amount} units at {co2_price_value} each."
+                            f"Attempting fuel purchase: {amount} liters at {fuel_price_value} each."
                         )
-                        self.buy_co2(amount, co2_price_value)
+                        self.buy_fuel(amount, fuel_price_value)
                     else:
-                        log("Not enough balance to buy CO2 right now.")
-            except NoSuchElementException:
-                log("CO2 popup button was not found.")
-        except TimeoutException:
-            log("Timed out while waiting for the consumable windows.")
+                        log("Not enough balance to buy fuel right now.")
+
+                # CO2 panel is opened by clicking the button in the popup.
+                try:
+                    self.driver.find_element(By.ID, "popBtn2").click()
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "co2Main"))
+                    )
+                    co2_panel = self.driver.find_element(By.ID, "co2Main")
+                    co2_price = co2_panel.find_element(By.CSS_SELECTOR, ".price")
+                    co2_price_value = self.parse_int(co2_price.text)
+                    log(
+                        "CO2 snapshot: "
+                        f"current price={co2_price_value}, "
+                        f"threshold={self.co2_threshold}"
+                    )
+                    if co2_price_value <= self.co2_threshold:
+                        capacity = self.parse_int(
+                            co2_panel.find_element(By.CSS_SELECTOR, ".capacity").text
+                        )
+                        balance = self.get_bank_balance()
+                        if balance is None:
+                            return
+                        buyable = int(balance / co2_price_value * 1000) if co2_price_value else 0
+                        amount = min(buyable, capacity)
+                        if amount > 0:
+                            log(
+                                f"Attempting CO2 purchase: {amount} units at {co2_price_value} each."
+                            )
+                            self.buy_co2(amount, co2_price_value)
+                        else:
+                            log("Not enough balance to buy CO2 right now.")
+                except NoSuchElementException:
+                    log("CO2 popup button was not found.")
+            except TimeoutException:
+                log("Timed out while waiting for the consumable windows.")
+            return
+
+        # If explicit http mode, use requests-only parsing regardless of
+        # available browser automation. Use get_fuel_snapshot() which has
+        # more robust parsing, and implement get_co2_snapshot() for CO2.
+        if self.mode == "http":
+            try:
+                fuel_snapshot = self.get_fuel_snapshot()
+                if not fuel_snapshot:
+                    log("Fuel snapshot not available (http mode).")
+                else:
+                    fuel_price_value = fuel_snapshot.get("price", 0)
+                    capacity = fuel_snapshot.get("remaining_capacity", 0)
+                    log(f"Fuel snapshot (http): current price={fuel_price_value}, threshold={self.fuel_threshold}")
+                    if fuel_price_value <= self.fuel_threshold and capacity > 0:
+                        balance = self.get_bank_balance()
+                        if balance is None:
+                            return
+                        buyable = int(balance / fuel_price_value * 1000) if fuel_price_value else 0
+                        amount = min(buyable, capacity)
+                        if amount > 0:
+                            log(f"Attempting fuel purchase: {amount} liters at {fuel_price_value} each.")
+                            self.buy_fuel(amount, fuel_price_value)
+                        else:
+                            log("Not enough balance to buy fuel right now.")
+
+                # CO2 via a lightweight snapshot
+                co2_snapshot = self.get_co2_snapshot()
+                if not co2_snapshot:
+                    log("CO2 snapshot not available (http mode).")
+                else:
+                    co2_price_value = co2_snapshot.get("price", 0)
+                    capacity = co2_snapshot.get("remaining_capacity", 0)
+                    log(f"CO2 snapshot (http): current price={co2_price_value}, threshold={self.co2_threshold}")
+                    if co2_price_value <= self.co2_threshold and capacity > 0:
+                        balance = self.get_bank_balance()
+                        if balance is None:
+                            return
+                        buyable = int(balance / co2_price_value * 1000) if co2_price_value else 0
+                        amount = min(buyable, capacity)
+                        if amount > 0:
+                            log(f"Attempting CO2 purchase: {amount} units at {co2_price_value} each.")
+                            self.buy_co2(amount, co2_price_value)
+                        else:
+                            log("Not enough balance to buy CO2 right now.")
+            except requests.RequestException as exc:
+                log(f"Consumables scan via HTTP failed: {exc}")
+            return
+
+        # Playwright fallback: open fuel.php directly and parse DOM
+        if self.playwright_page is not None and self.playwright is not None:
+            try:
+                page = self.playwright_page
+                page.goto(f"{self.base_url}/fuel.php")
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                fuel_panel = soup.select_one("#fuelMain")
+                if not fuel_panel:
+                    log("Fuel panel not present on fuel.php (playwright).")
+                else:
+                    price_el = fuel_panel.select_one(".price")
+                    fuel_price_value = self.parse_int(price_el.get_text(" ", strip=True)) if price_el else 0
+                    log(
+                        "Fuel snapshot (playwright): "
+                        f"current price={fuel_price_value}, threshold={self.fuel_threshold}"
+                    )
+
+                    if fuel_price_value <= self.fuel_threshold:
+                        capacity_el = fuel_panel.select_one(".capacity")
+                        capacity = self.parse_int(capacity_el.get_text(" ", strip=True)) if capacity_el else 0
+                        balance = self.get_bank_balance()
+                        if balance is None:
+                            return
+                        buyable = int(balance / fuel_price_value * 1000) if fuel_price_value else 0
+                        amount = min(buyable, capacity)
+                        if amount > 0:
+                            log(f"Attempting fuel purchase: {amount} liters at {fuel_price_value} each.")
+                            self.buy_fuel(amount, fuel_price_value)
+                        else:
+                            log("Not enough balance to buy fuel right now.")
+
+                # Try CO2 page as well
+                page.goto(f"{self.base_url}/co2.php")
+                html2 = page.content()
+                soup2 = BeautifulSoup(html2, "html.parser")
+                co2_panel = soup2.select_one("#co2Main")
+                if co2_panel:
+                    price_el = co2_panel.select_one(".price")
+                    co2_price_value = self.parse_int(price_el.get_text(" ", strip=True)) if price_el else 0
+                    log(
+                        "CO2 snapshot (playwright): "
+                        f"current price={co2_price_value}, threshold={self.co2_threshold}"
+                    )
+                    if co2_price_value <= self.co2_threshold:
+                        capacity_el = co2_panel.select_one(".capacity")
+                        capacity = self.parse_int(capacity_el.get_text(" ", strip=True)) if capacity_el else 0
+                        balance = self.get_bank_balance()
+                        if balance is None:
+                            return
+                        buyable = int(balance / co2_price_value * 1000) if co2_price_value else 0
+                        amount = min(buyable, capacity)
+                        if amount > 0:
+                            log(f"Attempting CO2 purchase: {amount} units at {co2_price_value} each.")
+                            self.buy_co2(amount, co2_price_value)
+                        else:
+                            log("Not enough balance to buy CO2 right now.")
+                else:
+                    log("CO2 panel not present on co2.php (playwright).")
+            except Exception as exc:
+                log(f"Consumables scan via playwright failed: {exc}")
+            return
+
+        # pyppeteer fallback: open fuel.php directly and parse DOM
+        if self.pyppeteer_page is not None and self.pyppeteer_loop is not None:
+            try:
+                loop = self.pyppeteer_loop
+                loop.run_until_complete(self.pyppeteer_page.goto(f"{self.base_url}/fuel.php"))
+                html = loop.run_until_complete(self.pyppeteer_page.content())
+                soup = BeautifulSoup(html, "html.parser")
+                fuel_panel = soup.select_one("#fuelMain")
+                if not fuel_panel:
+                    log("Fuel panel not present on fuel.php (pyppeteer).")
+                    return
+                price_el = fuel_panel.select_one(".price")
+                fuel_price_value = self.parse_int(price_el.get_text(" ", strip=True)) if price_el else 0
+                log(
+                    "Fuel snapshot (pyppeteer): "
+                    f"current price={fuel_price_value}, threshold={self.fuel_threshold}"
+                )
+
+                if fuel_price_value <= self.fuel_threshold:
+                    capacity_el = fuel_panel.select_one(".capacity")
+                    capacity = self.parse_int(capacity_el.get_text(" ", strip=True)) if capacity_el else 0
+                    balance = self.get_bank_balance()
+                    if balance is None:
+                        return
+                    buyable = int(balance / fuel_price_value * 1000) if fuel_price_value else 0
+                    amount = min(buyable, capacity)
+                    if amount > 0:
+                        log(f"Attempting fuel purchase: {amount} liters at {fuel_price_value} each.")
+                        self.buy_fuel(amount, fuel_price_value)
+                    else:
+                        log("Not enough balance to buy fuel right now.")
+            except Exception as exc:
+                log(f"Consumables scan via pyppeteer failed: {exc}")
+            return
+        log("Browser automation is unavailable; cannot inspect consumable windows.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -820,6 +1256,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run one cycle and exit instead of looping.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "selenium", "pyppeteer", "playwright", "http"),
+        default="auto",
+        help="Automation mode: auto/selenium/pyppeteer/playwright/http (http forces requests-only).",
+    )
     return parser.parse_args()
 
 
@@ -908,6 +1350,7 @@ def main() -> int:
         depart_check_interval_max_seconds=args.depart_check_interval_max_seconds,
         fuel_check_interval_min_seconds=args.fuel_check_interval_min_seconds,
         fuel_check_interval_max_seconds=args.fuel_check_interval_max_seconds,
+        mode=args.mode,
     )
 
     try:

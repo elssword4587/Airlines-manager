@@ -35,6 +35,14 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+If you added `playwright` to `requirements.txt`, install the Playwright browsers after pip:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m playwright install --with-deps
+```
+
 If Chromium is still not working, the bot can still perform HTTP-based checks such as login, bank balance, and fuel page parsing, but browser-dependent actions may be limited.
 
 ## Configuration
@@ -119,6 +127,19 @@ Run in headless mode if your browser setup supports it:
 
 ```bash
 python am4_bot.py --headless
+```
+
+Modes
+ - `auto`: try Selenium, then Playwright, then Pyppeteer, then fall back to HTTP-only.
+ - `selenium`: force Selenium-only (will not try Playwright/Pyppeteer).
+ - `playwright`: force Playwright for browser automation.
+ - `pyppeteer`: force Pyppeteer for browser automation.
+ - `http`: use requests-only mode (no browser automation).
+
+Example (HTTP-only):
+
+```bash
+python am4_bot.py --mode http --once --headless --email your-email --password your-pass
 ```
 
 ## Notes
