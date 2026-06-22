@@ -283,9 +283,11 @@ class AM4Bot:
         try:
             chrome_options = Options()
             if self.headless:
-                chrome_options.add_argument("--headless=new")
+                chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-software-rasterizer")
             chrome_options.add_argument("--window-size=430,900")
             chrome_options.add_argument("--user-agent=Mozilla/5.0")
             if self.chromium_path:
@@ -1356,6 +1358,7 @@ def main() -> int:
     try:
         bot.setup_driver()
         bot.ensure_logged_in()
+        bot.sync_session_cookies()
 
         last_depart_check = time.monotonic()
         last_fuel_check = time.monotonic()

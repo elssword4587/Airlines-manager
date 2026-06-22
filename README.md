@@ -16,17 +16,22 @@ git clone https://github.com/elssword4587/Airlines-manager
 cd Airlines-manager
 ```
 
-## Termux setup
+## Termux / Proot Ubuntu setup
 
-Install the required packages:
+The bot can run in two Termux environments:
+
+1. Native Termux with Chromium support
+2. Termux using `proot-distro` Ubuntu when native Chromium is unavailable
+
+### Option A: Native Termux
+
+Run these commands in Termux:
 
 ```bash
-pkg update && pkg upgrade
-pkg install python git clang
-pkg install chromium chromium-driver
+pkg update && pkg upgrade -y
+pkg install -y python git clang
+pkg install -y chromium chromium-driver
 ```
-
-If your Termux build does not provide a usable Chromium binary, you can also try a proot/Ubuntu-based setup and install Chromium there instead.
 
 Then install Python dependencies:
 
@@ -35,15 +40,75 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-If you added `playwright` to `requirements.txt`, install the Playwright browsers after pip:
+If you want Playwright support too:
 
 ```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python -m playwright install --with-deps
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-If Chromium is still not working, the bot can still perform HTTP-based checks such as login, bank balance, and fuel page parsing, but browser-dependent actions may be limited.
+### Option B: Termux + Ubuntu via proot-distro
+
+If your Termux build cannot run Chromium reliably, use a Ubuntu proot container.
+
+```bash
+pkg update && pkg upgrade -y
+pkg install -y proot-distro
+proot-distro install ubuntu
+```
+
+Then use the included helper script:
+
+```bash
+chmod +x run_termux_proot.sh
+./run_termux_proot.sh
+```
+
+This helper:
+
+- installs Ubuntu in `proot-distro` if needed
+- installs Python 3, pip, Chromium, and ChromeDriver inside Ubuntu
+- installs Python dependencies from `requirements.txt`
+- installs Playwright Chromium if available
+
+After the helper completes, run the bot in Ubuntu with:
+
+```bash
+python3 am4_bot.py --mode http --once --email your-email --password your-pass
+```
+
+If you want to enter Ubuntu manually instead of using the helper script:
+
+```bash
+proot-distro login ubuntu
+cd /data/data/com.termux/files/home/Airlines-manager
+python3 -m pip install -r requirements.txt
+python3 -m playwright install chromium
+python3 am4_bot.py --mode http --once --email your-email --password your-pass
+```
+
+### Browser mode vs HTTP-only mode
+
+The bot supports these modes:
+
+- `auto`: try Selenium, then Playwright, then Pyppeteer, then fall back to HTTP-only
+- `selenium`: force Selenium only
+- `playwright`: force Playwright only
+- `pyppeteer`: force Pyppeteer only
+- `http`: requests-only mode (no browser automation)
+
+Use HTTP-only mode when Chromium is unavailable or when you want a lighter Termux setup. In HTTP-only mode, the bot can still:
+
+- log in via requests
+- read bank balance
+- check departures via API endpoints
+- parse fuel and CO2 pages
+
+Example HTTP-only command:
+
+```bash
+python am4_bot.py --mode http --once --headless --email your-email --password your-pass
+```
 
 ## Configuration
 
